@@ -1,0 +1,42 @@
+# %%writefile /content/ALBEF/configs/Retrieval_msrvtt.yaml
+# Đường dẫn đến các file annotation và video của MSR-VTT
+# LƯU Ý: Bạn cần thay đổi '/path/to/your/DATASET/MSRVTT/' thành đường dẫn thực tế trên hệ thống của bạn.
+# Ví dụ: nếu bạn đặt thư mục DATASET trong thư mục dự án ALBEF, thì đường dẫn có thể là './DATASET/MSRVTT/'
+# Hoặc nếu bạn đặt nó trong /content/, thì là '/content/DATASET/MSRVTT/'
+msrvtt_root: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/' # Đảm bảo đường dẫn này chính xác
+
+# File annotation chính chứa tất cả captions và video_ids
+# Các file này sẽ được tạo bởi script prepare_msrvtt_data.py
+train_file:  ['/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_train.json']
+val_file: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_val.json'
+test_file: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_test.json'
+
+# Đường dẫn đến thư mục chứa các video thực tế
+# Dựa trên cấu trúc của bạn, các video nằm trong `MSRVTT/videos/all/`
+image_root: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/videos/all/'
+
+# Video-specific parameters cho VoP Giai đoạn 0
+num_frames_per_video: 12 # Số lượng khung hình sẽ lấy mẫu từ mỗi video, như trong bài báo VoP
+
+# Các tham số của mô hình ALBEF
+bert_config: 'configs/config_bert.json'
+
+# MSR-VTT thường sử dụng image_res 224x224
+image_res: 224 # Thay đổi từ 384 của flickr sang 224
+
+batch_size_train: 32
+batch_size_test: 64
+
+queue_size: 65536
+momentum: 0.995
+vision_width: 768
+embed_dim: 256
+temp: 0.07
+k_test: 128
+
+alpha: 0.4
+distill: True
+warm_up: True
+
+optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 1e-5, epochs: 10, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, cooldown_epochs: 0}

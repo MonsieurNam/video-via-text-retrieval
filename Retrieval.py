@@ -1,0 +1,419 @@
+# %%writefile /content/ALBEF/Retrieval.py
+import argparse
+import os
+from ruamel.yaml import YAML # Đổi từ ruamel_yaml thành ruamel.yaml
+import numpy as np
+import random
+import time
+import datetime
+import json
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+
+from models.model_retrieval import ALBEF
+from models.vit import interpolate_pos_embed
+from transformers import BertTokenizer
+
+import utils
+from dataset import create_dataset, create_sampler, create_loader
+from scheduler import create_scheduler
+from optim import create_optimizer
+
+
+def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
+    # train
+    model.train()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    header = 'Train Epoch: [{}]'.format(epoch)
+    print_freq = 50
+    step_size = 100
+    warmup_iterations = warmup_steps*step_size
+
+    # data_loader giờ đây sẽ trả về video (5D tensor), text, và idx
+    for i,(video, text, idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        video = video.to(device,non_blocking=True) # Thay image = image.to(device,...)
+        idx = idx.to(device,non_blocking=True)
+        text_input = tokenizer(text, padding='longest', max_length=30, return_tensors="pt").to(device)
+
+        if epoch>0 or not config['warm_up']:
+            alpha = config['alpha']
+        else:
+            alpha = config['alpha']*min(1,i/len(data_loader))
+
+        # Truyền video thay vì image vào model
+        loss_ita, loss_itm = model(video, text_input,alpha=alpha, idx=idx)
+        loss = loss_ita + loss_itm
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        metric_logger.update(loss_itm=loss_itm.item())
+        metric_logger.update(loss_ita=loss_ita.item())
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        if epoch==0 and i%step_size==0 and i<=warmup_iterations:
+            scheduler.step(i//step_size)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger.global_avg())
+    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
+
+
+
+@torch.no_grad()
+def evaluation(model, data_loader, tokenizer, device, config):
+    # test
+    model.eval()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Evaluation:'
+
+    print('Computing features for evaluation...')
+    start_time = time.time()
+
+    texts = data_loader.dataset.text
+    num_text = len(texts)
+    text_bs = 256
+    text_feats = []
+    text_embeds = []
+    text_atts = []
+    for i in range(0, num_text, text_bs):
+        text = texts[i: min(num_text, i+text_bs)]
+        text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
+        text_output = model.text_encoder(text_input.input_ids, attention_mask = text_input.attention_mask, mode='text')
+        text_feat = text_output.last_hidden_state
+        text_embed = F.normalize(model.text_proj(text_feat[:,0,:]))
+        text_embeds.append(text_embed)
+        text_feats.append(text_feat)
+        text_atts.append(text_input.attention_mask)
+    text_embeds = torch.cat(text_embeds,dim=0)
+    text_feats = torch.cat(text_feats,dim=0)
+    text_atts = torch.cat(text_atts,dim=0)
+
+    video_feats = [] # Sẽ lưu trữ video_embeds_fusion
+    video_embeds = [] # Sẽ lưu trữ video_feat (từ average pooling)
+
+    # data_loader trả về video, video_id
+    for video, video_id in data_loader:
+        video = video.to(device) # Shape: (B, F, C, H, W)
+        B, F, C, H, W = video.shape
+        video_flat = video.view(B*F, C, H, W) # Flatten video frames
+
+        # Xử lý từng khung hình
+        image_feat_flat = model.visual_encoder(video_flat)
+
+        # Lấy CLS token của từng khung hình và chiếu (project) nó
+        image_embed_flat = model.vision_proj(image_feat_flat[:,0,:])
+        image_embed_flat = F.normalize(image_embed_flat,dim=-1)
+
+        # Tổng hợp biểu diễn video
+        # (B, N, D) - N là num_patches+1, D là embed_dim
+        video_feat_pooled = image_feat_flat.view(B, F, image_feat_flat.size(1), -1).mean(dim=1)
+        # (B, D) - D là embed_dim
+        video_embed_pooled = image_embed_flat.view(B, F, -1).mean(dim=1)
+
+        video_feats.append(video_feat_pooled)
+        video_embeds.append(video_embed_pooled)
+
+    # Concatenate tất cả các biểu diễn video đã tính toán
+    image_feats = torch.cat(video_feats,dim=0)
+    image_embeds = torch.cat(video_embeds,dim=0)
+
+    sims_matrix = image_embeds @ text_embeds.t()
+    # Kích thước ma trận score_matrix_i2t dựa trên số lượng video thực tế
+    score_matrix_i2t = torch.full((len(data_loader.dataset.video_ids),len(texts)),-100.0).to(device)
+
+    num_tasks = utils.get_world_size()
+    rank = utils.get_rank()
+    step = sims_matrix.size(0)//num_tasks + 1
+    start = rank*step
+    end = min(sims_matrix.size(0),start+step)
+
+    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)):
+        topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+
+        # encoder_output và encoder_att cần được tạo ra từ image_feats (biểu diễn video)
+        # image_feats[start+i] là biểu diễn video tổng hợp cho một video cụ thể
+        encoder_output = image_feats[start+i].unsqueeze(0).repeat(config['k_test'],1,1) # Add unsqueeze(0) để tạo batch dim
+        encoder_att = torch.ones(encoder_output.size()[:-1],dtype=torch.long).to(device)
+        output = model.text_encoder(encoder_embeds = text_feats[topk_idx],
+                                    attention_mask = text_atts[topk_idx],
+                                    encoder_hidden_states = encoder_output,
+                                    encoder_attention_mask = encoder_att,
+                                    return_dict = True,
+                                    mode = 'fusion'
+                                   )
+        score = model.itm_head(output.last_hidden_state[:,0,:])[:,1]
+        score_matrix_i2t[start+i,topk_idx] = score
+
+    sims_matrix = sims_matrix.t()
+    # Kích thước ma trận score_matrix_t2i dựa trên số lượng video thực tế
+    score_matrix_t2i = torch.full((len(texts),len(data_loader.dataset.video_ids)),-100.0).to(device)
+
+    step = sims_matrix.size(0)//num_tasks + 1
+    start = rank*step
+    end = min(sims_matrix.size(0),start+step)
+
+    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)):
+
+        topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+        encoder_output = image_feats[topk_idx]
+        encoder_att = torch.ones(encoder_output.size()[:-1],dtype=torch.long).to(device)
+        output = model.text_encoder(encoder_embeds = text_feats[start+i].repeat(config['k_test'],1,1),
+                                    attention_mask = text_atts[start+i].repeat(config['k_test'],1),
+                                    encoder_hidden_states = encoder_output,
+                                    encoder_attention_mask = encoder_att,
+                                    return_dict = True,
+                                    mode = 'fusion'
+                                   )
+        score = model.itm_head(output.last_hidden_state[:,0,:])[:,1]
+        score_matrix_t2i[start+i,topk_idx] = score
+
+    if args.distributed:
+        dist.barrier()
+        torch.distributed.all_reduce(score_matrix_i2t, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(score_matrix_t2i, op=torch.distributed.ReduceOp.SUM)
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Evaluation time {}'.format(total_time_str))
+
+    return score_matrix_i2t.cpu().numpy(), score_matrix_t2i.cpu().numpy()
+
+
+
+@torch.no_grad()
+def itm_eval(scores_i2t, scores_t2i, txt2img, img2txt):
+
+    #Images->Text
+    ranks = np.zeros(scores_i2t.shape[0])
+    for index,score in enumerate(scores_i2t):
+        inds = np.argsort(score)[::-1]
+        # Score
+        rank = 1e20
+        for i in img2txt[index]:
+            tmp = np.where(inds == i)[0][0]
+            if tmp < rank:
+                rank = tmp
+        ranks[index] = rank
+
+    # Compute metrics
+    tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    #Text->Images
+    ranks = np.zeros(scores_t2i.shape[0])
+
+    for index,score in enumerate(scores_t2i):
+        inds = np.argsort(score)[::-1]
+        ranks[index] = np.where(inds == txt2img[index])[0][0]
+
+    # Compute metrics
+    ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    ir5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    tr_mean = (tr1 + tr5 + tr10) / 3
+    ir_mean = (ir1 + ir5 + ir10) / 3
+    r_mean = (tr_mean + ir_mean) / 2
+
+    eval_result =  {'txt_r1': tr1,
+                    'txt_r5': tr5,
+                    'txt_r10': tr10,
+                    'txt_r_mean': tr_mean,
+                    'img_r1': ir1,
+                    'img_r5': ir5,
+                    'img_r10': ir10,
+                    'img_r_mean': ir_mean,
+                    'r_mean': r_mean}
+    return eval_result
+
+
+
+
+def main(args, config):
+    utils.init_distributed_mode(args)    
+    
+    device = torch.device(args.device)
+
+    # fix the seed for reproducibility
+    seed = args.seed + utils.get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    cudnn.benchmark = True
+
+    #### Dataset #### 
+    print("Creating retrieval dataset")
+    train_dataset, val_dataset, test_dataset = create_dataset('re', config)  
+
+    if args.distributed:
+        num_tasks = utils.get_world_size()
+        global_rank = utils.get_rank()            
+        samplers = create_sampler([train_dataset], [True], num_tasks, global_rank) + [None, None]
+    else:
+        samplers = [None, None, None]
+    
+    train_loader, val_loader, test_loader = create_loader([train_dataset, val_dataset, test_dataset],samplers,
+                                                          batch_size=[config['batch_size_train']]+[config['batch_size_test']]*2,
+                                                          num_workers=[4,4,4],
+                                                          is_trains=[True, False, False], 
+                                                          collate_fns=[None,None,None])   
+       
+    tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
+
+    #### Model #### 
+    print("Creating model")
+    if 'num_frames_per_video' not in config:
+        raise ValueError("num_frames_per_video must be specified in the config file.")
+    model = ALBEF(config=config, text_encoder=args.text_encoder, tokenizer=tokenizer)
+    
+    if args.checkpoint:    
+        checkpoint = torch.load(args.checkpoint, map_location='cpu') 
+        state_dict = checkpoint['model']
+        
+        # reshape positional embedding to accomodate for image resolution change
+        pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)         
+        state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped
+        m_pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder_m.pos_embed'],model.visual_encoder_m)   
+        state_dict['visual_encoder_m.pos_embed'] = m_pos_embed_reshaped 
+        
+        for key in list(state_dict.keys()):
+            if 'bert' in key:
+                encoder_key = key.replace('bert.','')         
+                state_dict[encoder_key] = state_dict[key] 
+                del state_dict[key]                
+        msg = model.load_state_dict(state_dict,strict=False)  
+        
+        print('load checkpoint from %s'%args.checkpoint)
+        print(msg)  
+        
+    
+    model = model.to(device)   
+    
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module   
+    
+    arg_opt = utils.AttrDict(config['optimizer'])
+    optimizer = create_optimizer(arg_opt, model)
+    arg_sche = utils.AttrDict(config['schedular']) # Đây là AttrDict cho scheduler
+    
+    # Sửa đổi tại đây để truy cập an toàn hơn
+    # Dòng này đã được sửa trong scheduler_factory.py, nhưng cần sửa cả ở đây
+    # vì biến `warmup_steps` vẫn được dùng ở `lr_scheduler.step(epoch+warmup_steps+1)`
+    max_epoch = arg_sche.get('epochs', 10) # Sử dụng .get() trên AttrDict
+    warmup_steps = arg_sche.get('warmup_epochs', 1) # Sử dụng .get() trên AttrDict
+
+    # Gọi create_scheduler với arg_sche
+    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
+
+    best = 0
+    best_epoch = 0
+
+    print("Start training")
+    start_time = time.time()    
+    for epoch in range(0, max_epoch):
+        if not args.evaluate:
+            if args.distributed:
+                train_loader.sampler.set_epoch(epoch)
+            train_stats = train(model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config)  
+            
+        score_val_i2t, score_val_t2i, = evaluation(model_without_ddp, val_loader, tokenizer, device, config)
+        score_test_i2t, score_test_t2i = evaluation(model_without_ddp, test_loader, tokenizer, device, config)
+    
+        if utils.is_main_process():  
+      
+            val_result = itm_eval(score_val_i2t, score_val_t2i, val_loader.dataset.txt2img, val_loader.dataset.img2txt)  
+            print(val_result)
+            test_result = itm_eval(score_test_i2t, score_test_t2i, test_loader.dataset.txt2img, test_loader.dataset.img2txt)    
+            print(test_result)
+            
+            if args.evaluate:                
+                log_stats = {**{f'val_{k}': v for k, v in val_result.items()},
+                             **{f'test_{k}': v for k, v in test_result.items()},                  
+                             'epoch': epoch,
+                            }
+                with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
+                    f.write(json.dumps(log_stats) + "\n")     
+            else:
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                             **{f'val_{k}': v for k, v in val_result.items()},
+                             **{f'test_{k}': v for k, v in test_result.items()},                  
+                             'epoch': epoch,
+                            }
+                with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
+                    f.write(json.dumps(log_stats) + "\n")   
+                    
+                if val_result['r_mean']>best:
+                    save_obj = {
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'config': config,
+                        'epoch': epoch,
+                    }
+                    torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth'))  
+                    best = val_result['r_mean']    
+                    best_epoch = epoch
+                    
+        if args.evaluate: 
+            break
+           
+        # Sử dụng `warmup_steps` đã được lấy một cách an toàn
+        lr_scheduler.step(epoch + warmup_steps + 1)  
+        dist.barrier()     
+        torch.cuda.empty_cache()
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str)) 
+
+    if utils.is_main_process():   
+        with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
+            f.write("best epoch: %d"%best_epoch)               
+
+            
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()     
+    parser.add_argument('--config', default='./configs/Retrieval_msrvtt.yaml')
+    parser.add_argument('--output_dir', default='output/Retrieval_msrvtt_baseline')        
+    parser.add_argument('--checkpoint', default='')   
+    parser.add_argument('--text_encoder', default='bert-base-uncased')
+    parser.add_argument('--evaluate', action='store_true')
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--distributed', default=True, type=bool)
+    args = parser.parse_args()
+
+    print(f"Loading config from: {args.config}")
+    yaml_parser = YAML(typ='safe')
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml_parser.load(f)
+    except FileNotFoundError:
+        print(f"Error: Config file not found at {args.config}")
+        exit(1) 
+    except Exception as e:
+        print(f"Error loading config file: {e}")
+        exit(1)
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    yaml_parser.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
+
+    main(args, config)
