@@ -6,7 +6,7 @@ import random
 
 # --- Cấu hình Đường dẫn ---
 # Thay đổi đường dẫn này để khớp với vị trí thư mục MSRVTT của bạn
-MSRVTT_ROOT = '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/'
+MSRVTT_ROOT = './data/MSRVTT/'
 
 FULL_ANNOTATION_FILE = os.path.join(MSRVTT_ROOT, 'annotation', 'MSR_VTT.json')
 TRAIN_VIDEO_IDS_FILE = os.path.join(MSRVTT_ROOT, 'high-quality/structured-symlinks', 'test_list_mini.txt')

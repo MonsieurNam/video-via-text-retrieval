@@ -1,0 +1,22 @@
+alpha: 0.4
+batch_size_test: 16
+batch_size_train: 4
+bert_config: configs/config_bert.json
+distill: true
+embed_dim: 256
+image_res: 224
+image_root: ./data/MSRVTT/videos/all/
+k_test: 10
+momentum: 0.995
+msrvtt_root: ./data/MSRVTT/
+num_frames_per_video: 4
+optimizer: {lr: 1e-05, opt: adamW, weight_decay: 0.02}
+queue_size: 65536
+schedular: {cooldown_epochs: 0, decay_rate: 1, epochs: 5, lr: 1e-05, min_lr: 1e-06,
+  sched: cosine, warmup_lr: 1e-05}
+temp: 0.07
+test_file: ./data/MSRVTT/annotation/msrvtt_test.json
+train_file: [./data/MSRVTT/annotation/msrvtt_train.json]
+val_file: ./data/MSRVTT/annotation/msrvtt_val.json
+vision_width: 768
+warm_up: true

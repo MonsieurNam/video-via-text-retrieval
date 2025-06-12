@@ -24,15 +24,29 @@ def autocontrast_func(img, cutoff=0):
             low = 0 if low.shape[0] == 0 else low[0]
             high = np.argwhere(np.cumsum(hist[::-1]) > cut)
             high = n_bins - 1 if high.shape[0] == 0 else n_bins - 1 - high[0]
+        
+        # --- SỬA ĐỔI TẠI ĐÂY (Cách tiếp cận mới) ---
+        # Kiểm tra nếu high và low trùng nhau (ảnh đơn sắc)
+        # hoặc nếu high nhỏ hơn low (một trường hợp biên hiếm gặp)
         if high <= low:
-            table = np.arange(n_bins)
-        else:
-            scale = (n_bins - 1) / (high - low)
-            offset = -low * scale
-            table = np.arange(n_bins) * scale + offset
-            table[table < 0] = 0
-            table[table > n_bins - 1] = n_bins - 1
-        table = table.clip(0, 255).astype(np.uint8)
+            # Nếu không có phạm vi để điều chỉnh, không làm gì cả
+            return ch 
+
+        # Nếu đã qua kiểm tra trên, high > low, nên diff luôn dương
+        diff = high - low
+        
+        # Tính toán scale và offset.
+        # Ở đây, phép chia sẽ không gây lỗi vì chúng ta đã kiểm tra diff > 0
+        scale = (n_bins - 1) / diff
+        offset = -low * scale
+        
+        table = np.arange(n_bins) * scale + offset
+        
+        # Kẹp giá trị cuối cùng để đảm bảo chúng nằm trong phạm vi [0, 255]
+        # Điều này là cần thiết do sai số của số thực
+        table = np.clip(table, 0, 255).astype(np.uint8)
+        # --- KẾT THÚC SỬA ĐỔI ---
+
         return table[ch]
 
     channels = [tune_channel(ch) for ch in cv2.split(img)]
@@ -88,13 +102,6 @@ def color_func(img, factor):
     '''
         same output as PIL.ImageEnhance.Color
     '''
-    ## implementation according to PIL definition, quite slow
-    #  degenerate = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[:, :, np.newaxis]
-    #  out = blend(degenerate, img, factor)
-    #  M = (
-    #      np.eye(3) * factor
-    #      + np.float32([0.114, 0.587, 0.299]).reshape(3, 1) * (1. - factor)
-    #  )[np.newaxis, np.newaxis, :]
     M = (
             np.float32([
                 [0.886, -0.114, -0.114],
