@@ -24,7 +24,7 @@ temp: 0.07
 k_test: 10
 
 alpha: 0.4
-distill: True
+distill: False
 warm_up: True
 
 optimizer: 

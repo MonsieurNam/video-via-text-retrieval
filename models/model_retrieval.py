@@ -89,7 +89,7 @@ class ALBEF(nn.Module):
         sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)     
 
         with torch.no_grad():
-            # self._momentum_update()
+            self._momentum_update()
             image_embeds_m_flat = self.visual_encoder_m(video_flat) 
             image_feat_m_flat = F.normalize(self.vision_proj_m(image_embeds_m_flat[:,0,:]),dim=-1)  
             image_feat_m = image_feat_m_flat.view(B, num_frames_video, -1).mean(dim=1) 
