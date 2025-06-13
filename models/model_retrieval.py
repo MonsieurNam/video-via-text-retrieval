@@ -4,7 +4,7 @@ from models.xbert import BertConfig, BertModel
 
 import torch
 from torch import nn
-import torch.nn.functional as F # Đảm bảo F là functional, không bị ghi đè
+import torch.nn.functional as F
 
 class ALBEF(nn.Module):
     def __init__(self,                 
@@ -15,18 +15,32 @@ class ALBEF(nn.Module):
         super().__init__()
         
         self.tokenizer = tokenizer 
-        self.distill = config['distill']
+        self.distill = config.get('distill', False)
+        
+        # --- Lấy config cho VOP ---
+        prompt_config = config.get('vop', None) 
+        # ------------------------
+        
         embed_dim = config['embed_dim']        
         vision_width = config['vision_width']  
         
         self.num_frames_per_video = config['num_frames_per_video'] 
 
+        # --- TRUYỀN PROMPT_CONFIG VÀO ViT VÀ BERT ---
         self.visual_encoder = VisionTransformer(
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
-            mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6))    
+            mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            prompt_config=prompt_config # Truyền config cho ViT
+        )    
 
         bert_config = BertConfig.from_json_file(config['bert_config'])
-        self.text_encoder = BertModel.from_pretrained(text_encoder, config=bert_config, add_pooling_layer=False)      
+        self.text_encoder = BertModel.from_pretrained(
+            text_encoder, 
+            config=bert_config, 
+            add_pooling_layer=False,
+            prompt_config=prompt_config # Truyền config cho BERT
+        )      
+        # ---------------------------------------------
 
         text_width = self.text_encoder.config.hidden_size
         self.vision_proj = nn.Linear(vision_width, embed_dim)
@@ -37,6 +51,7 @@ class ALBEF(nn.Module):
         self.momentum = config['momentum']  
         self.itm_head = nn.Linear(text_width, 2) 
         
+        # Momentum models không cần prompt và không cần thay đổi
         self.visual_encoder_m = VisionTransformer(
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6)) 
@@ -59,18 +74,37 @@ class ALBEF(nn.Module):
         self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
         
+        # --- HOÀN THIỆN LOGIC ĐÓNG BĂNG BACKBONE ---
+        if prompt_config:
+            print("--- Prompt Tuning is enabled. Freezing backbone encoders. ---")
+            
+            # Đóng băng visual encoder TRỪ visual_prompts
+            for name, param in self.visual_encoder.named_parameters():
+                if 'visual_prompts' not in name: 
+                    param.requires_grad = False
+            
+            # Đóng băng text encoder TRỪ textual_prompts
+            for name, param in self.text_encoder.named_parameters():
+                if 'textual_prompts' not in name:
+                    param.requires_grad = False
+            
+            # In ra các tham số có thể huấn luyện để kiểm tra
+            print("\nTrainable parameters:")
+            for name, param in self.named_parameters():
+                if param.requires_grad:
+                    print(name)
+            print("-" * 20)
+        # ----------------------------------------------------
+
 
     def forward(self, video, text, alpha, idx): 
-        # Đổi `F` thành `num_frames_video` để tránh ghi đè `torch.nn.functional as F`
         B, num_frames_video, C, H, W = video.shape 
         
         video_flat = video.view(B * num_frames_video, C, H, W)
         
         image_embeds_flat = self.visual_encoder(video_flat) 
-        # Dòng gây lỗi trước đó giờ sẽ hoạt động vì F vẫn là torch.nn.functional
         image_feat_flat = F.normalize(self.vision_proj(image_embeds_flat[:,0,:]),dim=-1) 
 
-        # --- TỔNG HỢP BIỂU DIỄN VIDEO BẰNG AVERAGE POOLING ---
         image_feat_per_frame = image_feat_flat.view(B, num_frames_video, -1)
         image_feat = image_feat_per_frame.mean(dim=1) 
         
@@ -82,46 +116,48 @@ class ALBEF(nn.Module):
                                         return_dict = True, mode = 'text')            
         text_embeds = text_output.last_hidden_state
         text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)                 
+        
+        if self.distill:
+            with torch.no_grad():
+                self._momentum_update()
+                image_embeds_m_flat = self.visual_encoder_m(video_flat) 
+                image_feat_m_flat = F.normalize(self.vision_proj_m(image_embeds_m_flat[:,0,:]),dim=-1)  
+                image_feat_m = image_feat_m_flat.view(B, num_frames_video, -1).mean(dim=1)
+                
+                text_output_m = self.text_encoder_m(text.input_ids, attention_mask = text.attention_mask, return_dict = True, mode = 'text')    
+                text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
 
-        idx = idx.view(-1,1)
-        idx_all = torch.cat([idx.t(), self.idx_queue.clone().detach()],dim=1)  
-        pos_idx = torch.eq(idx, idx_all).float()       
-        sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)     
-
-        with torch.no_grad():
-            self._momentum_update()
-            image_embeds_m_flat = self.visual_encoder_m(video_flat) 
-            image_feat_m_flat = F.normalize(self.vision_proj_m(image_embeds_m_flat[:,0,:]),dim=-1)  
-            image_feat_m = image_feat_m_flat.view(B, num_frames_video, -1).mean(dim=1) 
-            image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)                                         
-            
-            text_output_m = self.text_encoder_m(text.input_ids, attention_mask = text.attention_mask,             
-                                                return_dict = True, mode = 'text')    
-            text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
-            text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1)
-
-            if self.distill:               
+                image_feat_all = torch.cat([image_feat_m.t(), self.image_queue.clone().detach()], dim=1)                                         
+                text_feat_all = torch.cat([text_feat_m.t(), self.text_queue.clone().detach()], dim=1)
+                
                 sim_i2t_m = image_feat_m @ text_feat_all / self.temp 
                 sim_t2i_m = text_feat_m @ image_feat_all / self.temp   
 
+                idx_all = torch.cat([idx.view(-1,1).t(), self.idx_queue.clone().detach()],dim=1)  
+                pos_idx = torch.eq(idx.view(-1,1), idx_all).float()       
+                sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)   
+                
                 sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
-                sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets 
-
-        sim_i2t = image_feat @ text_feat_all / self.temp 
-        sim_t2i = text_feat @ image_feat_all / self.temp           
-
-        if self.distill:
+                sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets
+            
+            sim_i2t = image_feat @ text_feat_all / self.temp
+            sim_t2i = text_feat @ image_feat_all / self.temp
             loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_i2t_targets,dim=1).mean()
             loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_t2i_targets,dim=1).mean() 
-        else:
-            loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_targets,dim=1).mean()
-            loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_targets,dim=1).mean()   
+            
+            self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx.view(-1,1))
+        
+        else: 
+            sim_i2t = image_feat @ text_feat.t() / self.temp
+            sim_t2i = text_feat @ image_feat.t() / self.temp
+            
+            targets = torch.arange(B).to(video.device)
+            loss_i2t = F.cross_entropy(sim_i2t, targets)
+            loss_t2i = F.cross_entropy(sim_t2i, targets)
 
-        loss_ita = (loss_i2t+loss_t2i)/2
+        loss_ita = (loss_i2t + loss_t2i) / 2
 
-        self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx)
-
-        ###=================================###
+        # ITM loss 
         output_pos = self.text_encoder(encoder_embeds = text_embeds, 
                                         attention_mask = text.attention_mask,
                                         encoder_hidden_states = image_embeds_fusion, 
@@ -131,10 +167,18 @@ class ALBEF(nn.Module):
                                        )            
         with torch.no_grad():
             bs = video.size(0)      
-            weights_i2t = F.softmax(sim_i2t[:,:bs]+1e-4,dim=1)
-            weights_t2i = F.softmax(sim_t2i[:,:bs]+1e-4,dim=1)
+            
+            if self.distill:
+                sim_i2t_for_neg = sim_i2t[:, :bs]
+                sim_t2i_for_neg = sim_t2i[:, :bs]
+            else:
+                sim_i2t_for_neg = sim_i2t
+                sim_t2i_for_neg = sim_t2i
 
-            mask = torch.eq(idx, idx.T)
+            weights_i2t = F.softmax(sim_i2t_for_neg + 1e-4, dim=1)
+            weights_t2i = F.softmax(sim_t2i_for_neg + 1e-4, dim=1)
+
+            mask = torch.eq(idx.view(-1,1), idx.view(-1,1).T)
             weights_i2t.masked_fill_(mask, 0)
             weights_t2i.masked_fill_(mask, 0) 
 
@@ -176,22 +220,18 @@ class ALBEF(nn.Module):
 
         return loss_ita, loss_itm 
  
-
-
     @torch.no_grad()    
     def copy_params(self):
         for model_pair in self.model_pairs:           
             for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
-                param_m.data.copy_(param.data)  # initialize
-                param_m.requires_grad = False  # not update by gradient    
+                param_m.data.copy_(param.data)
+                param_m.requires_grad = False    
 
-            
     @torch.no_grad()        
     def _momentum_update(self):
         for model_pair in self.model_pairs:           
             for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
                 param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
-                
                 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, image_feat, text_feat, idx):
@@ -219,4 +259,4 @@ def concat_all_gather(tensor):
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
     output = torch.cat(tensors_gather, dim=0)
-    return output        
+    return output

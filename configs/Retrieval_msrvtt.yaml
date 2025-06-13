@@ -1,42 +1,39 @@
-msrvtt_root: './data/MSRVTT/'
+# Đường dẫn đến các file annotation và video của MSR-VTT
+msrvtt_root: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/' 
+train_file:  ['/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_train.json']
+val_file: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_val.json'
+test_file: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_test.json'
+image_root: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/videos/all/' 
 
-train_file:  ['./data/MSRVTT/annotation/msrvtt_train.json']
-val_file: './data/MSRVTT/annotation/msrvtt_val.json'
-test_file: './data/MSRVTT/annotation/msrvtt_test.json'
+# Video-specific parameters
+num_frames_per_video: 4
 
-image_root: './data/MSRVTT/videos/all/'
-
-# Giảm số frame nếu cần tiết kiệm GPU
-num_frames_per_video: 4   # ↓ từ 12 → 8 (có thể giảm nhiều GPU RAM)
-
+# Các tham số của mô hình ALBEF
 bert_config: 'configs/config_bert.json'
-image_res: 224  # giữ nguyên vì 224 khá nhẹ
-
-# ↓ GIẢM batch size để tránh lỗi OOM
-batch_size_train: 4       # từ 32 → 8
-batch_size_test: 16       # từ 64 → 32
+image_res: 224
+batch_size_train: 4 # Giảm batch size để tránh OOM khi thêm prompts
+batch_size_test: 1616 # Giảm batch size test tương ứng
 
 queue_size: 65536
 momentum: 0.995
 vision_width: 768
 embed_dim: 256
 temp: 0.07
-k_test: 10
+k_test: 128
 
-alpha: 0.4
-distill: False
+# Tắt distillation cho Giai đoạn 1 để tập trung vào hiệu quả của prompt
+distill: False 
+alpha: 0.4 # Tham số này không còn tác dụng khi distill=False
 warm_up: True
 
-optimizer: 
-  opt: adamW
-  lr: 1e-5
-  weight_decay: 0.02
+# --- THAY ĐỔI CHO PROMPT TUNING ---
+# 1. Thêm section mới 'vop'
+vop:
+  prompt_length_text: 8   # Độ dài prompt cho mỗi lớp của text encoder
+  prompt_length_vision: 8 # Độ dài prompt cho mỗi lớp của vision encoder
+  prompt_depth_text: 12   # Số lớp được chèn prompt trong text encoder (12 = tất cả)
+  prompt_depth_vision: 12 # Số lớp được chèn prompt trong vision encoder
 
-schedular: 
-  sched: cosine
-  lr: 1e-5
-  epochs: 5
-  min_lr: 1e-6
-  decay_rate: 1
-  warmup_lr: 1e-5
-  cooldown_epochs: 0
+# 2. Tăng learning rate cho prompt tuning
+optimizer: {opt: adamW, lr: 1e-4, weight_decay: 0.02} 
+schedular: {sched: cosine, lr: 1e-4, epochs: 10, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0} 
