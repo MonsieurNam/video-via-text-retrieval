@@ -1,9 +1,9 @@
 # Đường dẫn đến các file annotation và video của MSR-VTT
-msrvtt_root: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/' 
-train_file:  ['/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_train.json']
-val_file: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_val.json'
-test_file: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/annotation/msrvtt_test.json'
-image_root: '/content/drive/MyDrive/Intern_FPT/AI/DATASET/MSRVTT/videos/all/' 
+msrvtt_root: './data/MSRVTT/' 
+train_file:  ['./data/MSRVTT/annotation/msrvtt_train.json']
+val_file: './data/MSRVTT/annotation/msrvtt_val.json'
+test_file: './data/MSRVTT/annotation/msrvtt_test.json'
+image_root: './data/MSRVTT/videos/all/' 
 
 # Video-specific parameters
 num_frames_per_video: 4
