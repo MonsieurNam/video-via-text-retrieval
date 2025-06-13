@@ -19,7 +19,7 @@ momentum: 0.995
 vision_width: 768
 embed_dim: 256
 temp: 0.07
-k_test: 128
+k_test: 10
 
 # Tắt distillation cho Giai đoạn 1 để tập trung vào hiệu quả của prompt
 distill: False 

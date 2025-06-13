@@ -223,15 +223,32 @@ class ALBEF(nn.Module):
     @torch.no_grad()    
     def copy_params(self):
         for model_pair in self.model_pairs:           
-            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
-                param_m.data.copy_(param.data)
-                param_m.requires_grad = False    
+            # Lấy state dict của student và momentum models
+            student_model_state_dict = model_pair[0].state_dict()
+            momentum_model = model_pair[1]
+            
+            # Chỉ nạp các key có trong cả hai
+            momentum_model.load_state_dict(student_model_state_dict, strict=False)
+            
+            # Đảm bảo momentum model không được huấn luyện
+            for param_m in momentum_model.parameters():
+                param_m.requires_grad = False  
 
+            
     @torch.no_grad()        
     def _momentum_update(self):
-        for model_pair in self.model_pairs:           
-            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
-                param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
+        for model_pair in self.model_pairs:
+            # Lấy state dict của student
+            student_params = model_pair[0].state_dict()
+            
+            # Cập nhật từng tham số trong momentum model
+            for name, param_m in model_pair[1].named_parameters():
+                # Chỉ cập nhật nếu tham số có tồn tại trong student model
+                if name in student_params:
+                    param_student = student_params[name]
+                    # Kiểm tra kích thước để đảm bảo an toàn
+                    if param_m.size() == param_student.size():
+                        param_m.data = param_m.data * self.momentum + param_student.data * (1. - self.momentum)
                 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, image_feat, text_feat, idx):
