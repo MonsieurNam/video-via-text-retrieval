@@ -12,7 +12,7 @@ num_frames_per_video: 4
 bert_config: 'configs/config_bert.json'
 image_res: 224
 batch_size_train: 4 # Giảm batch size để tránh OOM khi thêm prompts
-batch_size_test: 1616 # Giảm batch size test tương ứng
+batch_size_test: 16 # Giảm batch size test tương ứng
 
 queue_size: 65536
 momentum: 0.995
