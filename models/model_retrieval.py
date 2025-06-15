@@ -182,20 +182,42 @@ class ALBEF(nn.Module):
             weights_i2t.masked_fill_(mask, 0)
             weights_t2i.masked_fill_(mask, 0) 
 
+        # select a negative video for each text
         video_embeds_neg = []    
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+            # --- THÊM KIỂM TRA Ở ĐÂY ---
+            # Nếu tất cả các trọng số đều bằng 0, chọn một negative ngẫu nhiên
+            if weights_t2i[b].sum() == 0:
+                # Tạo một tensor weights giả, gán xác suất đều cho các phần tử không phải là chính nó
+                temp_weights = torch.ones_like(weights_t2i[b])
+                temp_weights[b] = 0 # Loại trừ chính nó
+                neg_idx = torch.multinomial(temp_weights, 1).item()
+            else:
+                neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+            # --- KẾT THÚC KIỂM TRA ---
+
             video_embeds_neg.append(image_embeds_fusion[neg_idx]) 
         video_embeds_neg = torch.stack(video_embeds_neg,dim=0)   
 
+        # select a negative text for each video
         text_embeds_neg = []
         text_atts_neg = []
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            # --- THÊM KIỂM TRA TƯƠNG TỰ Ở ĐÂY ---
+            if weights_i2t[b].sum() == 0:
+                temp_weights = torch.ones_like(weights_i2t[b])
+                temp_weights[b] = 0
+                neg_idx = torch.multinomial(temp_weights, 1).item()
+            else:
+                neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            # --- KẾT THÚC KIỂM TRA ---
+
             text_embeds_neg.append(text_embeds[neg_idx])
             text_atts_neg.append(text.attention_mask[neg_idx])
         text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   
-        text_atts_neg = torch.stack(text_atts_neg,dim=0)      
+        text_atts_neg = torch.stack(text_atts_neg,dim=0)         
+
+
 
         text_embeds_all = torch.cat([text_embeds, text_embeds_neg],dim=0)     
         text_atts_all = torch.cat([text.attention_mask, text_atts_neg],dim=0)     
